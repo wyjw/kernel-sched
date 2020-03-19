@@ -82,12 +82,6 @@
 static struct kmem_cache * scheduler_cachep;
 static struct schedule_info *si;
 
-struct schedule_info{
-	struct task_struct *global_sqo_thread;
-	struct task_struct *head_sqo_thread;
-	struct completion	head_sqo_thread_started;
-
-};
 // Schedule adjustments
 
 struct io_uring {
@@ -375,6 +369,16 @@ struct io_submit_state {
 	unsigned int		has_refs;
 	unsigned int		used_refs;
 	unsigned int		ios_left;
+};
+
+struct schedule_info{
+	struct task_struct *global_sqo_thread;
+	struct task_struct *head_sqo_thread;
+	struct completion	head_sqo_thread_started;
+	struct context {
+		struct io_ring_ctx *ring_ctx;
+		struct list_head ctx_list;
+	} context;
 };
 
 static void io_sq_wq_submit_work(struct work_struct *work);
@@ -2314,8 +2318,150 @@ static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
 	return submitted;
 }
 
+static int io_sq_thread_ctx_list(void *data)
+{
+	printk(KERN_ERR "USING_NEW_THREAD_FUNCTION_NOW\n");
+
+	struct sqe_submit sqes[IO_IOPOLL_BATCH];
+	struct io_ring_ctx *ctx = data;
+	struct mm_struct *cur_mm = NULL;
+	struct list_head *ptr = NULL;
+	struct io_ring_ctx *ctx_ptr = NULL;
+
+	mm_segment_t old_fs;
+	DEFINE_WAIT(wait);
+	unsigned inflight;
+	unsigned long timeout;
+
+	//complete(&ctx->sqo_thread_started);
+	complete(&si->head_sqo_thread_started);
+
+	struct context context;
+	context.ring_ctx = ctx;
+	list_add(&context.ctx_list, &si->context.ctx_list);
+
+	old_fs = get_fs();
+	set_fs(USER_DS);
+
+	timeout = inflight = 0;
+	while (!kthread_should_park()) {
+		list_for_each(ptr, &si->context.ctx_list)
+		{
+		ctx_ptr = list_entry(ptr, struct context, ctx_list)->ring_ctx;
+		bool all_fixed, mm_fault = false;
+		int i;
+
+		if (inflight) {
+			unsigned nr_events = 0;
+
+			if (ctx_ptr->flags & IORING_SETUP_IOPOLL) {
+				io_iopoll_check(ctx_ptr, &nr_events, 0);
+			} else {
+				/*
+				 * Normal IO, just pretend everything completed.
+				 * We don't have to poll completions for that.
+				 */
+				nr_events = inflight;
+			}
+
+			inflight -= nr_events;
+			if (!inflight)
+				timeout = jiffies + ctx_ptr->sq_thread_idle;
+		}
+
+		if (!io_get_sqring(ctx_ptr, &sqes[0])) {
+			/*
+			 * We're polling. If we're within the defined idle
+			 * period, then let us spin without work before going
+			 * to sleep.
+			 */
+			if (inflight || !time_after(jiffies, timeout)) {
+				cpu_relax();
+				continue;
+			}
+
+			/*
+			 * Drop cur_mm before scheduling, we can't hold it for
+			 * long periods (or over schedule()). Do this before
+			 * adding ourselves to the waitqueue, as the unuse/drop
+			 * may sleep.
+			 */
+			if (cur_mm) {
+				unuse_mm(cur_mm);
+				mmput(cur_mm);
+				cur_mm = NULL;
+			}
+
+			prepare_to_wait(&ctx_ptr->sqo_wait, &wait,
+						TASK_INTERRUPTIBLE);
+
+			/* Tell userspace we may need a wakeup call */
+			ctx_ptr->sq_ring->flags |= IORING_SQ_NEED_WAKEUP;
+			/* make sure to read SQ tail after writing flags */
+			smp_mb();
+
+			if (!io_get_sqring(ctx_ptr, &sqes[0])) {
+				if (kthread_should_park()) {
+					finish_wait(&ctx_ptr->sqo_wait, &wait);
+					break;
+				}
+				if (signal_pending(current))
+					flush_signals(current);
+				schedule();
+				finish_wait(&ctx_ptr->sqo_wait, &wait);
+
+				ctx_ptr->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+				continue;
+			}
+			finish_wait(&ctx_ptr->sqo_wait, &wait);
+
+			ctx_ptr->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+		}
+
+		i = 0;
+		all_fixed = true;
+		do {
+			if (all_fixed && io_sqe_needs_user(sqes[i].sqe))
+				all_fixed = false;
+
+			i++;
+			if (i == ARRAY_SIZE(sqes))
+				break;
+		} while (io_get_sqring(ctx_ptr, &sqes[i]));
+
+		/* Unless all new commands are FIXED regions, grab mm */
+		if (!all_fixed && !cur_mm) {
+			mm_fault = !mmget_not_zero(ctx_ptr->sqo_mm);
+			if (!mm_fault) {
+				use_mm(ctx_ptr->sqo_mm);
+				cur_mm = ctx_ptr->sqo_mm;
+			}
+		}
+
+		inflight += io_submit_sqes(ctx_ptr, sqes, i, cur_mm != NULL,
+						mm_fault);
+
+		/* Commit SQ ring head once we've consumed all SQEs */
+		io_commit_sqring(ctx_ptr);
+		}
+	}
+
+	set_fs(old_fs);
+	if (cur_mm) {
+		unuse_mm(cur_mm);
+		mmput(cur_mm);
+	}
+
+	kthread_parkme();
+
+	return 0;
+}
+
 static int io_sq_thread(void *data)
 {
+
+	printk(KERN_ERR "USING_OLD_THREAD_FUNCTION_NOW\n");
+
 	struct sqe_submit sqes[IO_IOPOLL_BATCH];
 	struct io_ring_ctx *ctx = data;
 	struct mm_struct *cur_mm = NULL;
@@ -2771,9 +2917,12 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 							"io_uring-sq");
 			*/
 			if (!si->head_sqo_thread) {
-				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread,
+				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread_ctx_list,
 							ctx, cpu,
 							"io_uring-sq");
+			}
+			else{
+
 			}
 		} else {
 			/*
@@ -2781,8 +2930,12 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 							"io_uring-sq");
 			*/
 			if (!si->head_sqo_thread) {
-				si->head_sqo_thread = kthread_create(io_sq_thread, ctx,
+				printk(KERN_ERR "Got into the right thread.");
+				si->head_sqo_thread = kthread_create(io_sq_thread_ctx_list, ctx,
 								"io_uring-sq");
+			}
+			else {
+
 			}
 		}
 
@@ -3626,6 +3779,8 @@ static int __init io_uring_init(void)
 					"sq-scheduler");
 		printk(KERN_ERR "This is %d", si->global_sqo_thread->pid);
 		wake_up_process(si->global_sqo_thread);
+
+		INIT_LIST_HEAD(&si->context.ctx_list);
 	}
 
 	return 0;

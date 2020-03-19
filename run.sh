@@ -35,6 +35,10 @@ sudo mount -o loop $IMG $DIR
 sudo debootstrap --arch amd64 buster $DIR
 sudo chroot $DIR
 
+sudo umount -l
+
+ssh-keygen -t rsa -b 4096 -C "your_email@example.com"
+
 passwd
 apt install make
 apt install git
@@ -60,7 +64,7 @@ sudo chgrp netdev /dev/net/tun
 chmod 660 /dev/net/tun
 sudo chmod 660 /dev/net/tun
 stat /dev/net/tun
-udo 	
+udo
 sudo tunctl -p -t tap1 -u qemu
 
 
@@ -73,7 +77,8 @@ sudo tunctl -p -t tap1 -u qemu
 auto lo
 iface lo inet loopback
 #
-## To use dhcp:
+## To use dhcp:fallocate -l 5G a.img
+
 ##
 auto enp39s0
 iface enp39s0 inet dhcp
@@ -101,3 +106,6 @@ sudo dhclient -v br0
 apt install make
 apt install git
 apt install gcc
+
+# creating a new large file
+fallocate -l 5G a.img
