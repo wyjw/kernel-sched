@@ -2348,6 +2348,8 @@ static int io_sq_thread_ctx_list(void *data)
 		list_for_each(ptr, &si->context.ctx_list)
 		{
 		ctx_ptr = list_entry(ptr, struct context, ctx_list)->ring_ctx;
+		//go through contexts
+		//printk(KERN_ERR "Currently going through %d", ctx_ptr);
 		bool all_fixed, mm_fault = false;
 		int i;
 
@@ -2885,6 +2887,15 @@ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
 	return ret;
 }
 
+static int add_to_context_list(struct io_ring_ctx *ctx)
+{
+	printk(KERN_ERR "Added another example to context list.\n");
+	struct context *_ctx = kmalloc(sizeof(struct context), GFP_NOWAIT);
+	_ctx->ring_ctx = ctx;
+	list_add(&_ctx->ctx_list, &si->context.ctx_list);
+	return 0;
+}
+
 static int io_sq_offload_start(struct io_ring_ctx *ctx,
 			       struct io_uring_params *p)
 {
@@ -2922,7 +2933,7 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 							"io_uring-sq");
 			}
 			else{
-
+				add_to_context_list(ctx);
 			}
 		} else {
 			/*
@@ -2935,7 +2946,7 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 								"io_uring-sq");
 			}
 			else {
-
+				add_to_context_list(ctx);
 			}
 		}
 
