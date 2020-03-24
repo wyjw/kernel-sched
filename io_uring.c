@@ -378,7 +378,10 @@ struct schedule_info{
 	struct context {
 		struct io_ring_ctx *ring_ctx;
 		struct list_head ctx_list;
+		struct sqe_submit sqes[IO_IOPOLL_BATCH];
 	} context;
+	struct mutex	context_lock;
+	struct mutex  submit_lock;
 };
 
 static void io_sq_wq_submit_work(struct work_struct *work);
@@ -428,6 +431,7 @@ static struct io_ring_ctx *io_ring_ctx_alloc(struct io_uring_params *p)
 	//init_completion(&ctx->sqo_thread_started);
 	init_completion(&si->head_sqo_thread_started);
 	mutex_init(&ctx->uring_lock);
+	mutex_init(&si->context_lock);
 	init_waitqueue_head(&ctx->wait);
 	for (i = 0; i < ARRAY_SIZE(ctx->pending_async); i++) {
 		spin_lock_init(&ctx->pending_async[i].lock);
@@ -2264,6 +2268,7 @@ static bool io_get_sqring(struct io_ring_ctx *ctx, struct sqe_submit *s)
 	if (head < ctx->sq_entries) {
 		s->index = head;
 		s->sqe = &ctx->sq_sqes[head];
+		//s->needs_lock = true;
 		ctx->cached_sq_head++;
 		return true;
 	}
@@ -2321,12 +2326,11 @@ static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
 static int io_sq_thread_ctx_list(void *data)
 {
 	printk(KERN_ERR "USING_NEW_THREAD_FUNCTION_NOW\n");
-
-	struct sqe_submit sqes[IO_IOPOLL_BATCH];
 	struct io_ring_ctx *ctx = data;
 	struct mm_struct *cur_mm = NULL;
 	struct list_head *ptr = NULL;
 	struct io_ring_ctx *ctx_ptr = NULL;
+	struct context *context_ptr = NULL;
 
 	mm_segment_t old_fs;
 	DEFINE_WAIT(wait);
@@ -2336,20 +2340,17 @@ static int io_sq_thread_ctx_list(void *data)
 	//complete(&ctx->sqo_thread_started);
 	complete(&si->head_sqo_thread_started);
 
-	struct context context;
-	context.ring_ctx = ctx;
-	list_add(&context.ctx_list, &si->context.ctx_list);
-
 	old_fs = get_fs();
 	set_fs(USER_DS);
 
 	timeout = inflight = 0;
 	while (!kthread_should_park()) {
+		mutex_lock(&si->context_lock);
 		list_for_each(ptr, &si->context.ctx_list)
 		{
-		ctx_ptr = list_entry(ptr, struct context, ctx_list)->ring_ctx;
+		context_ptr = list_entry(ptr, struct context, ctx_list);
+		ctx_ptr = context_ptr->ring_ctx;
 		//go through contexts
-		//printk(KERN_ERR "Currently going through %d", ctx_ptr);
 		bool all_fixed, mm_fault = false;
 		int i;
 
@@ -2357,6 +2358,7 @@ static int io_sq_thread_ctx_list(void *data)
 			unsigned nr_events = 0;
 
 			if (ctx_ptr->flags & IORING_SETUP_IOPOLL) {
+				//printk(KERN_ERR "POLL UP\n");
 				io_iopoll_check(ctx_ptr, &nr_events, 0);
 			} else {
 				/*
@@ -2371,7 +2373,7 @@ static int io_sq_thread_ctx_list(void *data)
 				timeout = jiffies + ctx_ptr->sq_thread_idle;
 		}
 
-		if (!io_get_sqring(ctx_ptr, &sqes[0])) {
+		if (!io_get_sqring(ctx_ptr, &context_ptr->sqes[0])) {
 			/*
 			 * We're polling. If we're within the defined idle
 			 * period, then let us spin without work before going
@@ -2397,39 +2399,58 @@ static int io_sq_thread_ctx_list(void *data)
 			prepare_to_wait(&ctx_ptr->sqo_wait, &wait,
 						TASK_INTERRUPTIBLE);
 
+
 			/* Tell userspace we may need a wakeup call */
 			ctx_ptr->sq_ring->flags |= IORING_SQ_NEED_WAKEUP;
 			/* make sure to read SQ tail after writing flags */
 			smp_mb();
 
-			if (!io_get_sqring(ctx_ptr, &sqes[0])) {
+			//mutex_lock(&si->context_lock);
+			//printk(KERN_ERR "gOT FIRst lock\n");
+			if (!ctx_ptr){
+				//mutex_unlock(&si->context_lock);
+				break;
+			}
+
+			if (!io_get_sqring(ctx_ptr, &context_ptr->sqes[0])) {
 				if (kthread_should_park()) {
 					finish_wait(&ctx_ptr->sqo_wait, &wait);
 					break;
 				}
 				if (signal_pending(current))
 					flush_signals(current);
+				mutex_unlock(&si->context_lock);
 				schedule();
+				mutex_lock(&si->context_lock);
+				if (!ctx_ptr){
+					//mutex_unlock(&si->context_lock);
+					break;
+				}
 				finish_wait(&ctx_ptr->sqo_wait, &wait);
 
 				ctx_ptr->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+				//mutex_unlock(&si->context_lock);
 				continue;
+			}
+			if (!ctx_ptr){
+				//mutex_unlock(&si->context_lock);
+				break;
 			}
 			finish_wait(&ctx_ptr->sqo_wait, &wait);
 
 			ctx_ptr->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+			//mutex_unlock(&si->context_lock);
 		}
-
 		i = 0;
 		all_fixed = true;
 		do {
-			if (all_fixed && io_sqe_needs_user(sqes[i].sqe))
+			if (all_fixed && io_sqe_needs_user(context_ptr->sqes[i].sqe))
 				all_fixed = false;
 
 			i++;
-			if (i == ARRAY_SIZE(sqes))
+			if (i == ARRAY_SIZE(context_ptr->sqes))
 				break;
-		} while (io_get_sqring(ctx_ptr, &sqes[i]));
+		} while (io_get_sqring(ctx_ptr, &context_ptr->sqes[i]));
 
 		/* Unless all new commands are FIXED regions, grab mm */
 		if (!all_fixed && !cur_mm) {
@@ -2440,13 +2461,15 @@ static int io_sq_thread_ctx_list(void *data)
 			}
 		}
 
-		inflight += io_submit_sqes(ctx_ptr, sqes, i, cur_mm != NULL,
+		inflight += io_submit_sqes(ctx_ptr, context_ptr->sqes, i, cur_mm != NULL,
 						mm_fault);
 
 		/* Commit SQ ring head once we've consumed all SQEs */
 		io_commit_sqring(ctx_ptr);
 		}
+		mutex_unlock(&si->context_lock);
 	}
+
 
 	set_fs(old_fs);
 	if (cur_mm) {
@@ -2889,10 +2912,12 @@ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
 
 static int add_to_context_list(struct io_ring_ctx *ctx)
 {
+	mutex_lock(&si->context_lock);
 	printk(KERN_ERR "Added another example to context list.\n");
 	struct context *_ctx = kmalloc(sizeof(struct context), GFP_NOWAIT);
 	_ctx->ring_ctx = ctx;
 	list_add(&_ctx->ctx_list, &si->context.ctx_list);
+	mutex_unlock(&si->context_lock);
 	return 0;
 }
 
@@ -3330,10 +3355,31 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 	percpu_ref_kill(&ctx->refs);
 	mutex_unlock(&ctx->uring_lock);
 
-	io_poll_remove_all(ctx);
-	io_iopoll_reap_events(ctx);
-	wait_for_completion(&ctx->ctx_done);
-	io_ring_ctx_free(ctx);
+	mutex_lock(&si->context_lock);
+	printk(KERN_ERR "THIS IS WHERE our THreAD GOES\n");
+	struct io_ring_ctx *ctx_ptr = NULL;
+	struct list_head *ptr = NULL;
+	struct list_head *q = NULL;
+	list_for_each_safe(ptr, q, &si->context.ctx_list)
+	{
+		ctx_ptr = list_entry(ptr, struct context, ctx_list)->ring_ctx;
+		if (ctx_ptr == ctx)
+		{
+			list_del(ptr);
+			printk("Got Rid OF CONTeXT %d\n", ctx_ptr);
+			/*
+			io_poll_remove_all(ctx);
+			io_iopoll_reap_events(ctx);
+			wait_for_completion(&ctx->ctx_done);
+			io_ring_ctx_free(ctx);
+			*/
+			//printk("RETURN\n", ctx_ptr);
+			mutex_unlock(&si->context_lock);
+			return;
+		}
+	}
+	mutex_unlock(&si->context_lock);
+	return;
 }
 
 static int io_uring_release(struct inode *inode, struct file *file)
@@ -3531,7 +3577,7 @@ err:
 static int io_uring_create(unsigned entries, struct io_uring_params *p)
 {
 	// THIS IS TO CHECK THAT IT GOT HERE
-	printk(KERN_ERR "We got here with %d", si->global_sqo_thread->pid);
+	//printk(KERN_ERR "We got here with %d", si->global_sqo_thread->pid);
 
 
 	struct user_struct *user = NULL;
@@ -3743,14 +3789,6 @@ out_fput:
 	return ret;
 }
 
-static int io_sched_thread(void *data)
-{
-	struct schedule_info *si = data;
-	int x = 0;
-	printk(KERN_ERR "I am thread: %s[PID = %d]\n", current->comm, current->pid);
-	return 0;
-}
-
 static void init_once(void *foo)
 {
 		printk(KERN_ERR "GOT INTO IO_URING INIT CONSTRUCTOR\n");
@@ -3784,15 +3822,16 @@ static int __init io_uring_init(void)
 	si = kmem_cache_alloc(scheduler_cachep, GFP_NOWAIT);
 	if (!si)
 		printk(KERN_ERR "IF IT GETS HERE, THIS IS BROKEN\n");
+	/*
 	if (!si->global_sqo_thread)
 	{
 		si->global_sqo_thread = kthread_create(io_sched_thread,si,
 					"sq-scheduler");
 		printk(KERN_ERR "This is %d", si->global_sqo_thread->pid);
 		wake_up_process(si->global_sqo_thread);
-
-		INIT_LIST_HEAD(&si->context.ctx_list);
 	}
+	*/
+	INIT_LIST_HEAD(&si->context.ctx_list);
 
 	return 0;
 };
