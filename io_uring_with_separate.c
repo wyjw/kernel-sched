@@ -381,6 +381,7 @@ struct schedule_info{
 		struct sqe_submit sqes[IO_IOPOLL_BATCH];
 	} context;
 	struct mutex  submit_lock;
+	struct workqueue_struct *si_wq;
 };
 
 static void io_sq_wq_submit_work(struct work_struct *work);
@@ -2322,15 +2323,17 @@ static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
 }
 
 struct sq_work {
+	struct work_struct base_work;
 	struct io_ring_ctx *ctx_ptr;
 	struct mm_struct *cur_mm;
 	struct sqe_submit sqes[IO_IOPOLL_BATCH];
 };
 
-static int sq_do_work(struct sq_work *sq_w)
+static int sq_do_work(struct work_struct *work)
 {
 		//printk(KERN_ERR "USING_DO_WORK_FUNCTION,%d\n", sqes[0]);
 
+		struct sq_work* sq_w = container_of(work, struct sq_work, base_work);
 		//printk(KERN_ERR "ARRAY_SIZE: %d\n", ARRAY_SIZE(*sqes));
 		bool all_fixed, mm_fault = false;
 		int i;
@@ -2449,18 +2452,6 @@ static int io_sq_thread_ctx_list(void * data)
 			else {
 				struct mm_struct *cur_mm = NULL;
 				struct sq_work *sq_w = kmalloc(sizeof(struct sq_work), GFP_NOWAIT);
-				sq_w->ctx_ptr = ctx_ptr;
-
-				if (!cur_mm) {
-					mm_fault = !mmget_not_zero(ctx_ptr->sqo_mm);
-					if (!mm_fault) {
-						use_mm(ctx_ptr->sqo_mm);
-						cur_mm = ctx_ptr->sqo_mm;
-					}
-				}
-
-				sq_w->cur_mm = cur_mm;
-
 				/*
 				i = 0;
 				all_fixed = true;
@@ -2493,7 +2484,20 @@ static int io_sq_thread_ctx_list(void * data)
 					cur_mm = NULL;
 				}
 				*/
-				sq_do_work(sq_w);
+				INIT_WORK(&sq_w->base_work, (void *)sq_do_work);
+				sq_w->ctx_ptr = ctx_ptr;
+
+				if (!cur_mm) {
+					mm_fault = !mmget_not_zero(ctx_ptr->sqo_mm);
+					if (!mm_fault) {
+						use_mm(ctx_ptr->sqo_mm);
+						cur_mm = ctx_ptr->sqo_mm;
+					}
+				}
+
+				sq_w->cur_mm = cur_mm;
+				//sq_do_work(sq_w);
+				queue_work(si->si_wq, &sq_w->base_work);
 			}
 		}
 		rcu_read_unlock();
@@ -3029,6 +3033,13 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 	ctx->sqo_wq = alloc_workqueue("io_ring-wq", WQ_UNBOUND | WQ_FREEZABLE,
 			min(ctx->sq_entries - 1, 2 * num_online_cpus()));
 	if (!ctx->sqo_wq) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	si->si_wq = alloc_workqueue("io_ring-si-wq", WQ_HIGHPRI | WQ_CPU_INTENSIVE,
+			2 * num_online_cpus());
+	if (!si->si_wq) {
 		ret = -ENOMEM;
 		goto err;
 	}
