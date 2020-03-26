@@ -2443,7 +2443,31 @@ static int io_sq_thread_ctx_list(void * data)
 				cur_mm = NULL;
 				}
 			}
-			sq_do_work(ctx_ptr, cur_mm, &sqes);
+			i = 0;
+			all_fixed = true;
+			do {
+				if (all_fixed && io_sqe_needs_user(context_ptr->sqes[i].sqe))
+					all_fixed = false;
+
+				i++;
+				if (i == ARRAY_SIZE(context_ptr->sqes))
+					break;
+			} while (io_get_sqring(ctx_ptr, &context_ptr->sqes[i]));
+
+			/* Unless all new commands are FIXED regions, grab mm */
+			if (!all_fixed && !cur_mm) {
+				mm_fault = !mmget_not_zero(ctx_ptr->sqo_mm);
+				if (!mm_fault) {
+					use_mm(ctx_ptr->sqo_mm);
+					cur_mm = ctx_ptr->sqo_mm;
+				}
+			}
+
+			inflight += io_submit_sqes(ctx_ptr, context_ptr->sqes, i, cur_mm != NULL,
+							mm_fault);
+
+			/* Commit SQ ring head once we've consumed all SQEs */
+			io_commit_sqring(ctx_ptr);
 		}
 		rcu_read_unlock();
 		schedule();
