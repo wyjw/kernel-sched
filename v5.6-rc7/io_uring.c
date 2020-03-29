@@ -6137,6 +6137,18 @@ out_fput:
 	return ret;
 }
 
+static int add_to_context_list(struct io_ring_ctx *ctx)
+{
+	struct si_context *_ctx = kmalloc(sizeof(struct si_context), GFP_KERNEL);
+	_ctx->ring_ctx = ctx;
+	_ctx->si_sqes = kmalloc(array_size(sizeof(struct io_uring_sqe), ctx->sq_entries), GFP_KERNEL);
+	list_add_tail_rcu(&_ctx->ctx_list, &si->si_ctx->ctx_list);
+
+	si->ctx_len++;
+	printk(KERN_ERR "Added another example to context list.\n");
+	return 0;
+}
+
 static int io_sq_offload_start(struct io_ring_ctx *ctx,
 			       struct io_uring_params *p)
 {
@@ -6173,10 +6185,11 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread_ctx_list,
 							ctx, cpu,
 							"io_uring-sq");
+				add_to_context_list(ctx);
 				//ctx->sqo_thread = si->head_sqo_thread;
 			}
 			else{
-
+				add_to_context_list(ctx);
 			}
 		} else {
 
@@ -6186,7 +6199,11 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 			if (!si->head_sqo_thread) {
 				si->head_sqo_thread = kthread_create(io_sq_thread_ctx_list, NULL,
 								"io_uring-sq");
+				add_to_context_list(ctx);
 				//ctx->sqo_thread = si->head_sqo_thread;
+			}
+			else{
+				add_to_context_list(ctx);
 			}
 		}
 		if (IS_ERR(ctx->sqo_thread)) {
@@ -7426,6 +7443,7 @@ static int __init io_uring_init(void)
 	if (!si)
 		printk(KERN_ERR "IF IT GETS HERE, THIS IS BROKEN\n");
 	si->si_ctx = kmalloc(sizeof(struct si_context), GFP_KERNEL);
+	INIT_LIST_HEAD(&si->si_ctx->ctx_list);
 
 	return 0;
 };
