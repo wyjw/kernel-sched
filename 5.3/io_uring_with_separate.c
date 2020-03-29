@@ -2987,8 +2987,9 @@ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
 static int add_to_context_list(struct io_ring_ctx *ctx)
 {
 	printk(KERN_ERR "Added another example to context list.\n");
-	struct context *_ctx = kmalloc(sizeof(struct context), GFP_NOWAIT);
+	struct context *_ctx = kmalloc(sizeof(struct context), GFP_KERNEL);
 	_ctx->ring_ctx = ctx;
+	_ctx->
 	list_add_rcu(&_ctx->ctx_list, &si->context.ctx_list);
 	si->ctx_len++;
 	return 0;
