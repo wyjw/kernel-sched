@@ -5124,6 +5124,129 @@ fail_req:
 	return submitted;
 }
 
+
+static int io_sq_thread_ctx_list(void *data)
+{
+	struct io_ring_ctx *ctx = data;
+	struct mm_struct *cur_mm = NULL;
+	const struct cred *old_cred;
+	mm_segment_t old_fs;
+	DEFINE_WAIT(wait);
+	unsigned long timeout;
+	int ret = 0;
+
+	complete(&ctx->completions[1]);
+
+	old_fs = get_fs();
+	set_fs(USER_DS);
+	old_cred = override_creds(ctx->creds);
+
+	timeout = jiffies + ctx->sq_thread_idle;
+	while (!kthread_should_park()) {
+		unsigned int to_submit;
+
+		if (!list_empty(&ctx->poll_list)) {
+			unsigned nr_events = 0;
+
+			mutex_lock(&ctx->uring_lock);
+			if (!list_empty(&ctx->poll_list))
+				io_iopoll_getevents(ctx, &nr_events, 0);
+			else
+				timeout = jiffies + ctx->sq_thread_idle;
+			mutex_unlock(&ctx->uring_lock);
+		}
+
+		to_submit = io_sqring_entries(ctx);
+
+		/*
+		 * If submit got -EBUSY, flag us as needing the application
+		 * to enter the kernel to reap and flush events.
+		 */
+		if (!to_submit || ret == -EBUSY) {
+			/*
+			 * Drop cur_mm before scheduling, we can't hold it for
+			 * long periods (or over schedule()). Do this before
+			 * adding ourselves to the waitqueue, as the unuse/drop
+			 * may sleep.
+			 */
+			if (cur_mm) {
+				unuse_mm(cur_mm);
+				mmput(cur_mm);
+				cur_mm = NULL;
+			}
+
+			/*
+			 * We're polling. If we're within the defined idle
+			 * period, then let us spin without work before going
+			 * to sleep. The exception is if we got EBUSY doing
+			 * more IO, we should wait for the application to
+			 * reap events and wake us up.
+			 */
+			if (!list_empty(&ctx->poll_list) ||
+			    (!time_after(jiffies, timeout) && ret != -EBUSY &&
+			    !percpu_ref_is_dying(&ctx->refs))) {
+				cond_resched();
+				continue;
+			}
+
+			prepare_to_wait(&ctx->sqo_wait, &wait,
+						TASK_INTERRUPTIBLE);
+
+			/*
+			 * While doing polled IO, before going to sleep, we need
+			 * to check if there are new reqs added to poll_list, it
+			 * is because reqs may have been punted to io worker and
+			 * will be added to poll_list later, hence check the
+			 * poll_list again.
+			 */
+			if ((ctx->flags & IORING_SETUP_IOPOLL) &&
+			    !list_empty_careful(&ctx->poll_list)) {
+				finish_wait(&ctx->sqo_wait, &wait);
+				continue;
+			}
+
+			/* Tell userspace we may need a wakeup call */
+			ctx->rings->sq_flags |= IORING_SQ_NEED_WAKEUP;
+			/* make sure to read SQ tail after writing flags */
+			smp_mb();
+
+			to_submit = io_sqring_entries(ctx);
+			if (!to_submit || ret == -EBUSY) {
+				if (kthread_should_park()) {
+					finish_wait(&ctx->sqo_wait, &wait);
+					break;
+				}
+				if (signal_pending(current))
+					flush_signals(current);
+				schedule();
+				finish_wait(&ctx->sqo_wait, &wait);
+
+				ctx->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
+				continue;
+			}
+			finish_wait(&ctx->sqo_wait, &wait);
+
+			ctx->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
+		}
+
+		mutex_lock(&ctx->uring_lock);
+		ret = io_submit_sqes(ctx, to_submit, NULL, -1, &cur_mm, true);
+		mutex_unlock(&ctx->uring_lock);
+		timeout = jiffies + ctx->sq_thread_idle;
+	}
+
+	set_fs(old_fs);
+	if (cur_mm) {
+		unuse_mm(cur_mm);
+		mmput(cur_mm);
+	}
+	revert_creds(old_cred);
+
+	kthread_parkme();
+
+	return 0;
+}
+
 static int io_sq_thread(void *data)
 {
 	struct io_ring_ctx *ctx = data;
