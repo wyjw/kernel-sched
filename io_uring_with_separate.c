@@ -382,6 +382,10 @@ struct schedule_info{
 	} context;
 	struct mutex  submit_lock;
 	struct workqueue_struct *si_wq;
+	wait_queue_head_t	si_wait;
+	struct mm_struct	*si_cur_mm;
+	int ctx_len;
+	unsigned sq_thread_idle;
 };
 
 static void io_sq_wq_submit_work(struct work_struct *work);
@@ -2325,7 +2329,7 @@ static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
 struct sq_work {
 	struct work_struct base_work;
 	struct io_ring_ctx *ctx_ptr;
-	struct mm_struct *cur_mm;
+	//struct mm_struct *cur_mm;
 	struct sqe_submit sqes[IO_IOPOLL_BATCH];
 };
 
@@ -2340,7 +2344,7 @@ static int sq_do_work(struct work_struct *work)
 		unsigned inflight;
 		unsigned long timeout;
 		struct io_ring_ctx *ctx_ptr = sq_w->ctx_ptr;
-		struct mm_struct *cur_mm = sq_w->cur_mm;
+		struct mm_struct *cur_mm = si->si_cur_mm;
 
 		/*
 		i = 0;
@@ -2371,11 +2375,13 @@ static int sq_do_work(struct work_struct *work)
 		/* Commit SQ ring head once we've consumed all SQEs */
 		io_commit_sqring(ctx_ptr);
 
+		/*
 		if (cur_mm) {
-			unuse_mm(sq_w->cur_mm);
-			mmput(sq_w->cur_mm);
-			sq_w->cur_mm = NULL;
+			unuse_mm(si->cur_mm);
+			mmput(si->cur_mm);
+			si->cur_mm = NULL;
 		}
+		*/
 }
 
 static int io_sq_thread_ctx_list(void * data)
@@ -2385,11 +2391,14 @@ static int io_sq_thread_ctx_list(void * data)
 	struct io_ring_ctx *ctx_ptr = NULL;
 	struct context *context_ptr = NULL;
 	struct list_head *ctx_list = NULL;
+	struct mm_struct *cur_mm = NULL;
+	struct sqe_submit sqes[IO_IOPOLL_BATCH];
 
 	mm_segment_t old_fs;
 	DEFINE_WAIT(wait);
 	unsigned inflight;
 	unsigned long timeout;
+	unsigned nr_events;
 
 	//complete(&ctx->sqo_thread_started);
 	complete(&si->head_sqo_thread_started);
@@ -2402,7 +2411,7 @@ static int io_sq_thread_ctx_list(void * data)
 		rcu_read_lock();
 		list_for_each_entry_rcu(context_ptr, &si->context.ctx_list, ctx_list)
 		{
-		struct sqe_submit sqes[IO_IOPOLL_BATCH];
+		int j = 0;
 		//printk(KERN_ERR "HERE bEFORE BReAK\n");
 		//context_ptr = list_entry(ptr, struct context, ctx_list);
 		ctx_ptr = context_ptr->ring_ctx;
@@ -2412,10 +2421,9 @@ static int io_sq_thread_ctx_list(void * data)
 		int i;
 
 		if (inflight) {
-			unsigned nr_events = 0;
+			nr_events = 0;
 
 			if (ctx_ptr->flags & IORING_SETUP_IOPOLL) {
-				//printk(KERN_ERR "POLL UP\n");
 				io_iopoll_check(ctx_ptr, &nr_events, 0);
 			} else {
 				/*
@@ -2427,81 +2435,112 @@ static int io_sq_thread_ctx_list(void * data)
 
 			inflight -= nr_events;
 			if (!inflight)
-				timeout = jiffies + ctx_ptr->sq_thread_idle;
+				timeout = jiffies + si->ctx_len * si->sq_thread_idle;
 		}
 
 		if (!io_get_sqring(ctx_ptr, &sqes[0]))
 		{
-			/*
-			 * We're polling. If we're within the defined idle
-			 * period, then let us spin without work before going
-			 * to sleep.
-			 */
-			if (inflight || !time_after(jiffies, timeout)) {
-				cpu_relax();
-				continue;
-			}
-
-			/*
-			 * Drop cur_mm before scheduling, we can't hold it for
-			 * long periods (or over schedule()). Do this before
-			 * adding ourselves to the waitqueue, as the unuse/drop
-			 * may sleep.
-			 */
-			}
-			else {
-				struct mm_struct *cur_mm = NULL;
-				struct sq_work *sq_w = kmalloc(sizeof(struct sq_work), GFP_NOWAIT);
-				/*
-				i = 0;
-				all_fixed = true;
-				do {
-					if (all_fixed && io_sqe_needs_user(sqes[i].sqe))
-						all_fixed = false;
-
-					i++;
-					if (i == ARRAY_SIZE(sqes))
-					{
+			j++;
+			if (j == si->ctx_len)
+			{
+				if (inflight || !time_after(jiffies, timeout)) {
+					cpu_relax();
 					break;
-					}
-				} while (io_get_sqring(ctx_ptr, &sqes[i]));
-
-				if (!all_fixed && !cur_mm) {
-					mm_fault = !mmget_not_zero(ctx_ptr->sqo_mm);
-					if (!mm_fault) {
-						use_mm(ctx_ptr->sqo_mm);
-						cur_mm = ctx_ptr->sqo_mm;
-					}
 				}
 
-				inflight += io_submit_sqes(ctx_ptr, &sqes[0], i, cur_mm != NULL, mm_fault);
+				prepare_to_wait(&si->si_wait, &wait,
+							TASK_INTERRUPTIBLE);
 
-				io_commit_sqring(ctx_ptr);
+				ctx_ptr->sq_ring->flags |= IORING_SQ_NEED_WAKEUP;
+				smp_mb();
 
-				if (cur_mm) {
-					unuse_mm(cur_mm);
-					mmput(cur_mm);
-					cur_mm = NULL;
+				if (kthread_should_park()) {
+					finish_wait(&si->si_wait, &wait);
+					break;
 				}
-				*/
-				INIT_WORK(&sq_w->base_work, (void *)sq_do_work);
-				sq_w->ctx_ptr = ctx_ptr;
-
-				if (!cur_mm) {
-					mm_fault = !mmget_not_zero(ctx_ptr->sqo_mm);
-					if (!mm_fault) {
-						use_mm(ctx_ptr->sqo_mm);
-						cur_mm = ctx_ptr->sqo_mm;
-					}
-				}
-
-				sq_w->cur_mm = cur_mm;
-				//sq_do_work(sq_w);
-				queue_work(si->si_wq, &sq_w->base_work);
+				if (signal_pending(current))
+					flush_signals(current);
+				rcu_read_unlock();
+				printk(KERN_ERR "SCHEDULE");
+				schedule();
+				printk(KERN_ERR "CAME BACK");
+				finish_wait(&si->si_wait, &wait);
+				break;
 			}
 		}
+		else {
+			//struct mm_struct *cur_mm = NULL;
+			//struct sq_work *sq_w = kmalloc(sizeof(struct sq_work), GFP_NOWAIT);
+			i = 0;
+			j = 0;
+			all_fixed = true;
+			do {
+				if (all_fixed && io_sqe_needs_user(sqes[i].sqe))
+					all_fixed = false;
+
+				i++;
+				if (i == ARRAY_SIZE(sqes))
+				{
+				break;
+				}
+			} while (io_get_sqring(ctx_ptr, &sqes[i]));
+
+			if (!all_fixed && !cur_mm) {
+				mm_fault = !mmget_not_zero(si->si_cur_mm);
+				printk(KERN_ERR "memory is %d", si->si_cur_mm);
+				if (!mm_fault) {
+					use_mm(si->si_cur_mm);
+					cur_mm = si->si_cur_mm;
+				}
+			}
+
+			inflight += io_submit_sqes(ctx_ptr, &sqes[0], i, cur_mm != NULL, mm_fault);
+
+			io_commit_sqring(ctx_ptr);
+
+			/*
+			INIT_WORK(&sq_w->base_work, (void *)sq_do_work);
+			sq_w->ctx_ptr = ctx_ptr;
+
+			if (!si->si_cur_mm) {
+				mm_fault = !mmget_not_zero(si->si_cur_mm);
+				if (!mm_fault) {
+					use_mm(si->si_cur_mm);
+					//cur_mm = si->si_cur_mm;
+				}
+			}
+
+			//sq_w->cur_mm = cur_mm;
+			//sq_do_work(sq_w);
+			queue_work(si->si_wq, &sq_w->base_work);
+			*/
+			}
+
+		}
+		/*
+		if (!io_get_sqring(ctx_ptr, &sqes[0]))
+		{
+			prepare_to_wait(&si->si_wait, &wait,
+						TASK_INTERRUPTIBLE);
+
+			ctx_ptr->sq_ring->flags |= IORING_SQ_NEED_WAKEUP;
+			smp_mb();
+
+			if (!io_get_sqring(ctx_ptr, &context_ptr->sqes[0])) {
+				if (kthread_should_park()) {
+					finish_wait(&si->si_wait, &wait);
+					break;
+				}
+				if (signal_pending(current))
+					flush_signals(current);
+				rcu_read_unlock();
+				schedule();
+				rcu_read_lock();
+				finish_wait(&si->si_wait, &wait);
+				ctx_ptr->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+			}
+		*/
 		rcu_read_unlock();
-		schedule();
 	}
 
 	set_fs(old_fs);
@@ -2951,6 +2990,7 @@ static int add_to_context_list(struct io_ring_ctx *ctx)
 	struct context *_ctx = kmalloc(sizeof(struct context), GFP_NOWAIT);
 	_ctx->ring_ctx = ctx;
 	list_add_rcu(&_ctx->ctx_list, &si->context.ctx_list);
+	si->ctx_len++;
 	return 0;
 }
 
@@ -2960,14 +3000,17 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 	int ret;
 
 	init_waitqueue_head(&ctx->sqo_wait);
+	init_waitqueue_head(&si->si_wait);
 	mmgrab(current->mm);
 	ctx->sqo_mm = current->mm;
+	si->si_cur_mm = current->mm;
 
 	if (ctx->flags & IORING_SETUP_SQPOLL) {
 		ret = -EPERM;
 		if (!capable(CAP_SYS_ADMIN))
 			goto err;
 
+		si->sq_thread_idle = msecs_to_jiffies(p->sq_thread_idle);
 		ctx->sq_thread_idle = msecs_to_jiffies(p->sq_thread_idle);
 		if (!ctx->sq_thread_idle)
 			ctx->sq_thread_idle = HZ;
@@ -3407,6 +3450,7 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 		if (ctx_ptr == ctx)
 		{
 			list_del_rcu(ptr);
+			si->ctx_len--;
 			//printk("Got Rid OF CONTeXT %d\n", ctx_ptr);
 			/*
 			io_poll_remove_all(ctx);
