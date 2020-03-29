@@ -759,7 +759,7 @@ struct si_context {
 struct schedule_info{
 	struct task_struct *head_sqo_thread;
 	struct completion	head_sqo_thread_started;
-	struct si_context si_ctx;
+	struct si_context* si_ctx;
 	struct mutex  submit_lock;
 	wait_queue_head_t	si_wait;
 	struct mm_struct	*si_cur_mm;
@@ -6164,12 +6164,30 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 			if (!cpu_online(cpu))
 				goto err;
 
+
 			ctx->sqo_thread = kthread_create_on_cpu(io_sq_thread,
 							ctx, cpu,
 							"io_uring-sq");
+
+			if (!si->head_sqo_thread) {
+				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread_ctx_list,
+							ctx, cpu,
+							"io_uring-sq");
+				//ctx->sqo_thread = si->head_sqo_thread;
+			}
+			else{
+
+			}
 		} else {
+
 			ctx->sqo_thread = kthread_create(io_sq_thread, ctx,
 							"io_uring-sq");
+
+			if (!si->head_sqo_thread) {
+				si->head_sqo_thread = kthread_create(io_sq_thread_ctx_list, NULL,
+								"io_uring-sq");
+				//ctx->sqo_thread = si->head_sqo_thread;
+			}
 		}
 		if (IS_ERR(ctx->sqo_thread)) {
 			ret = PTR_ERR(ctx->sqo_thread);
@@ -7407,6 +7425,7 @@ static int __init io_uring_init(void)
 	si = kmalloc(sizeof(struct schedule_info), GFP_NOWAIT);
 	if (!si)
 		printk(KERN_ERR "IF IT GETS HERE, THIS IS BROKEN\n");
+	si->si_ctx = kmalloc(sizeof(struct si_context), GFP_KERNEL);
 
 	return 0;
 };
