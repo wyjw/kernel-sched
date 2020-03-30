@@ -5137,13 +5137,20 @@ static int io_sq_thread_ctx_list(void *data)
 	unsigned long timeout;
 	int ret = 0;
 
-	complete(&ctx->completions[1]);
+	rcu_read_lock();
+	list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
+	{
+		ctx_ptr = context_ptr->ring_ctx;
+		complete(&ctx_ptr->completions[1]);
 
-	old_fs = get_fs();
-	set_fs(USER_DS);
-	old_cred = override_creds(ctx->creds);
+		old_fs = get_fs();
+		set_fs(USER_DS);
+		old_cred = override_creds(ctx_ptr->creds);
 
-	timeout = jiffies + ctx->sq_thread_idle;
+		timeout = jiffies + ctx_ptr->sq_thread_idle;
+	}
+	rcu_read_unlock();
+
 	while (!kthread_should_park()) {
 		rcu_read_lock();
 		list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
@@ -5191,7 +5198,9 @@ static int io_sq_thread_ctx_list(void *data)
 				if (!list_empty(&ctx_ptr->poll_list) ||
 				    (!time_after(jiffies, timeout) && ret != -EBUSY &&
 				    !percpu_ref_is_dying(&ctx_ptr->refs))) {
+					rcu_read_unlock();
 					cond_resched();
+					rcu_read_lock();
 					continue;
 				}
 
@@ -6223,6 +6232,7 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 		wake_up_process(ctx->sqo_thread);
 	  }
 	  */
+		wake_up_process(si->head_sqo_thread);
 	if (p->flags & IORING_SETUP_SQ_AFF) {
 		/* Can't have SQ_AFF without SQPOLL */
 		ret = -EINVAL;
