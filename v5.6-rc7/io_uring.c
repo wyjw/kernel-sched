@@ -5161,12 +5161,14 @@ static int io_sq_thread_ctx_list(void *data)
 			if (!list_empty(&ctx_ptr->poll_list)) {
 				unsigned nr_events = 0;
 
+				rcu_read_unlock();
 				mutex_lock(&ctx_ptr->uring_lock);
 				if (!list_empty(&ctx_ptr->poll_list))
 					io_iopoll_getevents(ctx_ptr, &nr_events, 0);
 				else
 					timeout = jiffies + ctx_ptr->sq_thread_idle;
 				mutex_unlock(&ctx_ptr->uring_lock);
+				rcu_read_lock();
 			}
 
 			to_submit = io_sqring_entries(ctx_ptr);
@@ -5183,9 +5185,11 @@ static int io_sq_thread_ctx_list(void *data)
 				 * may sleep.
 				 */
 				if (cur_mm) {
+					rcu_read_unlock();
 					unuse_mm(cur_mm);
 					mmput(cur_mm);
 					cur_mm = NULL;
+					rcu_read_lock();
 				}
 
 				/*
@@ -5201,11 +5205,11 @@ static int io_sq_thread_ctx_list(void *data)
 					rcu_read_unlock();
 					cond_resched();
 					rcu_read_lock();
-					continue;
+					goto next;
 				}
 
-				prepare_to_wait(&ctx_ptr->sqo_wait, &wait,
-							TASK_INTERRUPTIBLE);
+				//prepare_to_wait(&ctx_ptr->sqo_wait, &wait,
+				//			TASK_INTERRUPTIBLE);
 
 				/*
 				 * While doing polled IO, before going to sleep, we need
@@ -5216,7 +5220,7 @@ static int io_sq_thread_ctx_list(void *data)
 				 */
 				if ((ctx_ptr->flags & IORING_SETUP_IOPOLL) &&
 				    !list_empty_careful(&ctx_ptr->poll_list)) {
-					finish_wait(&ctx->sqo_wait, &wait);
+					//finish_wait(&ctx->sqo_wait, &wait);
 					continue;
 				}
 
@@ -5228,29 +5232,39 @@ static int io_sq_thread_ctx_list(void *data)
 				to_submit = io_sqring_entries(ctx_ptr);
 				if (!to_submit || ret == -EBUSY) {
 					if (kthread_should_park()) {
-						finish_wait(&ctx_ptr->sqo_wait, &wait);
-						break;
+						rcu_read_unlock();
+						kthread_parkme();
+						rcu_read_lock();
+						//finish_wait(&ctx_ptr->sqo_wait, &wait);
+						goto next;
 					}
 					if (signal_pending(current))
 						flush_signals(current);
+
+					rcu_read_unlock();
 					schedule();
-					finish_wait(&ctx_ptr->sqo_wait, &wait);
-
-					ctx_ptr->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
-					continue;
+					//finish_wait(&ctx_ptr->sqo_wait, &wait);
+					rcu_read_lock();
+					//ctx_ptr->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
+					goto next;
 				}
-				finish_wait(&ctx_ptr->sqo_wait, &wait);
+				//finish_wait(&ctx_ptr->sqo_wait, &wait);
 
-				ctx_ptr->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
+				//ctx_ptr->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
 			}
 
+			rcu_read_unlock();
 			mutex_lock(&ctx_ptr->uring_lock);
 			ret = io_submit_sqes(ctx_ptr, to_submit, NULL, -1, &cur_mm, true);
 			mutex_unlock(&ctx_ptr->uring_lock);
+			rcu_read_lock();
 			timeout = jiffies + ctx_ptr->sq_thread_idle;
 		}
+next:
 		rcu_read_unlock();
 	}
+
+	//rcu_read_unlock();
 
 	set_fs(old_fs);
 	if (cur_mm) {
@@ -5368,9 +5382,11 @@ static int io_sq_thread(void *data)
 			ctx->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
 		}
 
+		rcu_read_unlock();
 		mutex_lock(&ctx->uring_lock);
 		ret = io_submit_sqes(ctx, to_submit, NULL, -1, &cur_mm, true);
 		mutex_unlock(&ctx->uring_lock);
+		rcu_read_lock();
 		timeout = jiffies + ctx->sq_thread_idle;
 	}
 
@@ -6659,6 +6675,23 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 		io_cqring_overflow_flush(ctx, true);
 	idr_for_each(&ctx->personality_idr, io_remove_personalities, ctx);
 	wait_for_completion(&ctx->completions[0]);
+
+	// code for si context list cleanup
+	struct io_ring_ctx *ctx_ptr = NULL;
+	struct list_head *ptr = NULL;
+	struct list_head *q = NULL;
+	list_for_each_safe(ptr, q, &si->si_ctx->ctx_list)
+	{
+		ctx_ptr = list_entry(ptr, struct si_context, ctx_list)->ring_ctx;
+		if (ctx_ptr == ctx)
+		{
+			list_del_rcu(ptr);
+			si->ctx_len--;
+			return;
+		}
+	}
+	return;
+
 	io_ring_ctx_free(ctx);
 }
 
