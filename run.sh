@@ -109,3 +109,6 @@ apt install gcc
 
 # creating a new large file
 fallocate -l 5G a.img
+
+#debug stuff
+addr2line -f -e vmlinux 30c
