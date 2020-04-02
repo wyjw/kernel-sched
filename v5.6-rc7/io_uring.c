@@ -754,6 +754,7 @@ struct si_context {
 	struct list_head ctx_list;
 	//struct sqe_submit sqes[IO_IOPOLL_BATCH];
 	struct io_uring_sqe	*si_sqes;
+	struct mm_struct *cur_mm;
 };
 
 struct schedule_info{
@@ -1066,6 +1067,7 @@ static struct io_uring_cqe *io_get_cqring(struct io_ring_ctx *ctx)
 		return NULL;
 
 	ctx->cached_cq_tail++;
+	//printk(KERN_ERR "result: %d", &rings->cqes[tail & ctx->cq_mask].res);
 	return &rings->cqes[tail & ctx->cq_mask];
 }
 
@@ -1180,6 +1182,10 @@ static void io_cqring_fill_event(struct io_kiocb *req, long res)
 		}
 		req->flags |= REQ_F_OVERFLOW;
 		refcount_inc(&req->refs);
+		if (res == -EFAULT)
+		{
+			printk(KERN_ERR "error is on 1187");
+		}
 		req->result = res;
 		list_add_tail(&req->list, &ctx->cq_overflow_list);
 	}
@@ -1591,7 +1597,10 @@ static void io_iopoll_complete(struct io_ring_ctx *ctx, unsigned int *nr_events,
 
 		io_cqring_fill_event(req, req->result);
 		(*nr_events)++;
-
+		if (req->result == -EFAULT)
+		{
+			printk(KERN_ERR "line has error");
+		}
 		if (refcount_dec_and_test(&req->refs) &&
 		    !io_req_multi_free(&rb, req))
 			io_free_req(req);
@@ -2011,22 +2020,33 @@ static ssize_t io_import_fixed(struct io_kiocb *req, int rw,
 
 	/* attempt to use fixed buffers without having provided iovecs */
 	if (unlikely(!ctx->user_bufs))
+	{
+		printk(KERN_ERR "LINE 2015\n");
 		return -EFAULT;
-
+	}
 	buf_index = (unsigned long) req->rw.kiocb.private;
 	if (unlikely(buf_index >= ctx->nr_user_bufs))
+	{
+		printk(KERN_ERR "LINE 2021\n");
 		return -EFAULT;
-
+	}
 	index = array_index_nospec(buf_index, ctx->nr_user_bufs);
 	imu = &ctx->user_bufs[index];
 	buf_addr = req->rw.addr;
 
 	/* overflow */
 	if (buf_addr + len < buf_addr)
+	{
+		printk(KERN_ERR "LINE 2031\n");
 		return -EFAULT;
+	}
+
 	/* not inside the mapped region */
 	if (buf_addr < imu->ubuf || buf_addr + len > imu->ubuf + imu->len)
+	{
+		printk(KERN_ERR "LINE 2038\n");
 		return -EFAULT;
+	}
 
 	/*
 	 * May not be a start of buffer, set size appropriately
@@ -2113,7 +2133,15 @@ static ssize_t io_import_iovec(int rw, struct io_kiocb *req,
 						iovec, iter);
 #endif
 
-	return import_iovec(rw, buf, sqe_len, UIO_FASTIOV, iovec, iter);
+	int x = import_iovec(rw, buf, sqe_len, UIO_FASTIOV, iovec, iter);
+	/*
+	if (x == -EFAULT)
+	{
+		printk(KERN_ERR "This is an efault\n");
+	}
+	*/
+	//dump_stack();
+	return x;
 }
 
 /*
@@ -2706,7 +2734,10 @@ static int io_epoll_ctl_prep(struct io_kiocb *req,
 
 		ev = u64_to_user_ptr(READ_ONCE(sqe->addr));
 		if (copy_from_user(&req->epoll.event, ev, sizeof(*ev)))
+		{
+			printk(KERN_ERR "LINE 2721\n");
 			return -EFAULT;
+		}
 	}
 
 	return 0;
@@ -4572,6 +4603,10 @@ static void io_wq_submit_work(struct io_wq_work **workptr)
 
 	if (ret) {
 		req_set_fail_links(req);
+		if (ret == -EFAULT)
+		{
+			printk(KERN_ERR "This is an efault\n");
+		}
 		io_cqring_add_event(req, ret);
 		io_put_req(req);
 	}
@@ -4821,6 +4856,10 @@ static void io_queue_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (ret) {
 		if (ret != -EIOCBQUEUED) {
 fail_req:
+			if (ret == -EFAULT)
+			{
+				printk(KERN_ERR "This is an efault\n");
+			}
 			io_cqring_add_event(req, ret);
 			req_set_fail_links(req);
 			io_double_put_req(req);
@@ -5093,12 +5132,29 @@ fail_req:
 		if (io_op_defs[req->opcode].needs_mm && !*mm) {
 			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
 			if (unlikely(mm_fault)) {
+				printk(KERN_ERR "1");
 				err = -EFAULT;
 				goto fail_req;
 			}
 			use_mm(ctx->sqo_mm);
 			*mm = ctx->sqo_mm;
+			si->si_cur_mm = ctx->sqo_mm;
 		}
+
+		//ADDED THIS CODE TO GET RIGHT MM
+		if (si->si_cur_mm != mm)
+		{
+			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
+			if (unlikely(mm_fault)) {
+				printk(KERN_ERR "1");
+				err = -EFAULT;
+				goto fail_req;
+			}
+			use_mm(ctx->sqo_mm);
+			*mm = ctx->sqo_mm;
+			si->si_cur_mm = ctx->sqo_mm;
+		}
+
 
 		req->in_async = async;
 		req->needs_fixed_file = async;
@@ -5128,7 +5184,7 @@ fail_req:
 static int io_sq_thread_ctx_list(void *data)
 {
 	struct io_ring_ctx *ctx = data;
-	struct mm_struct *cur_mm = NULL;
+	//struct mm_struct *cur_mm = NULL;
 	struct io_ring_ctx *ctx_ptr = NULL;
 	struct si_context *context_ptr = NULL;
 	const struct cred *old_cred;
@@ -5157,6 +5213,9 @@ static int io_sq_thread_ctx_list(void *data)
 		{
 			unsigned int to_submit;
 			ctx_ptr = context_ptr->ring_ctx;
+			//cur_mm = context_ptr->cur_mm;
+
+			//printk(KERN_ERR "RING is %d\n", ctx_ptr->rings);
 
 			if (!list_empty(&ctx_ptr->poll_list)) {
 				unsigned nr_events = 0;
@@ -5184,11 +5243,11 @@ static int io_sq_thread_ctx_list(void *data)
 				 * adding ourselves to the waitqueue, as the unuse/drop
 				 * may sleep.
 				 */
-				if (cur_mm) {
+				if (si->si_cur_mm) {
 					rcu_read_unlock();
-					unuse_mm(cur_mm);
-					mmput(cur_mm);
-					cur_mm = NULL;
+					unuse_mm(si->si_cur_mm);
+					mmput(si->si_cur_mm);
+					si->si_cur_mm = NULL;
 					rcu_read_lock();
 				}
 
@@ -5203,6 +5262,7 @@ static int io_sq_thread_ctx_list(void *data)
 				    (!time_after(jiffies, timeout) && ret != -EBUSY &&
 				    !percpu_ref_is_dying(&ctx_ptr->refs))) {
 					rcu_read_unlock();
+					printk(KERN_ERR "rescheduled\n");
 					cond_resched();
 					rcu_read_lock();
 					goto next;
@@ -5233,6 +5293,7 @@ static int io_sq_thread_ctx_list(void *data)
 				if (!to_submit || ret == -EBUSY) {
 					if (kthread_should_park()) {
 						rcu_read_unlock();
+						printk(KERN_ERR "parked\n");
 						kthread_parkme();
 						rcu_read_lock();
 						//finish_wait(&ctx_ptr->sqo_wait, &wait);
@@ -5255,7 +5316,9 @@ static int io_sq_thread_ctx_list(void *data)
 
 			rcu_read_unlock();
 			mutex_lock(&ctx_ptr->uring_lock);
-			ret = io_submit_sqes(ctx_ptr, to_submit, NULL, -1, &cur_mm, true);
+			ret = io_submit_sqes(ctx_ptr, to_submit, NULL, -1, &context_ptr->cur_mm, true);
+			//printk(KERN_ERR "RING is %d\n", ctx_ptr->rings);
+			//printk(KERN)
 			mutex_unlock(&ctx_ptr->uring_lock);
 			rcu_read_lock();
 			timeout = jiffies + ctx_ptr->sq_thread_idle;
@@ -5267,9 +5330,9 @@ next:
 	//rcu_read_unlock();
 
 	set_fs(old_fs);
-	if (cur_mm) {
-		unuse_mm(cur_mm);
-		mmput(cur_mm);
+	if (si->si_cur_mm) {
+		unuse_mm(si->si_cur_mm);
+		mmput(si->si_cur_mm);
 	}
 	revert_creds(old_cred);
 
@@ -5927,12 +5990,21 @@ static int io_sqe_files_register(struct io_ring_ctx *ctx, void __user *arg,
 		kfree(ctx->file_data);
 		ctx->file_data = NULL;
 		ctx->nr_user_files = 0;
+		if (ret == -EFAULT)
+		{
+			printk(KERN_ERR "line has error");
+		}
 		return ret;
 	}
 
 	ret = io_sqe_files_scm(ctx);
 	if (ret)
 		io_sqe_files_unregister(ctx);
+
+	if (ret == -EFAULT)
+	{
+		printk(KERN_ERR "LINE 5940");
+	}
 
 	return ret;
 }
@@ -6046,6 +6118,7 @@ static int __io_sqe_files_update(struct io_ring_ctx *ctx,
 
 		err = 0;
 		if (copy_from_user(&fd, &fds[done], sizeof(fd))) {
+			printk(KERN_ERR "LINE 6051");
 			err = -EFAULT;
 			break;
 		}
@@ -6102,7 +6175,10 @@ static int io_sqe_files_update(struct io_ring_ctx *ctx, void __user *arg,
 	if (!nr_args)
 		return -EINVAL;
 	if (copy_from_user(&up, arg, sizeof(up)))
+	{
+		printk(KERN_ERR "4");
 		return -EFAULT;
+	}
 	if (up.resv)
 		return -EINVAL;
 
@@ -6175,6 +6251,8 @@ static int add_to_context_list(struct io_ring_ctx *ctx)
 	struct si_context *_ctx = kmalloc(sizeof(struct si_context), GFP_KERNEL);
 	_ctx->ring_ctx = ctx;
 	_ctx->si_sqes = kmalloc(array_size(sizeof(struct io_uring_sqe), ctx->sq_entries), GFP_KERNEL);
+	//_ctx->cur_mm = ctx->sqo_mm;
+	_ctx->cur_mm = NULL;
 	list_add_tail_rcu(&_ctx->ctx_list, &si->si_ctx->ctx_list);
 
 	si->ctx_len++;
@@ -6388,8 +6466,10 @@ static int io_copy_iov(struct io_ring_ctx *ctx, struct iovec *dst,
 
 		ciovs = (struct compat_iovec __user *) arg;
 		if (copy_from_user(&ciov, &ciovs[index], sizeof(ciov)))
+		{
+			printk(KERN_ERR "LINE 6416\n");
 			return -EFAULT;
-
+		}
 		dst->iov_base = u64_to_user_ptr((u64)ciov.iov_base);
 		dst->iov_len = ciov.iov_len;
 		return 0;
@@ -6397,7 +6477,10 @@ static int io_copy_iov(struct io_ring_ctx *ctx, struct iovec *dst,
 #endif
 	src = (struct iovec __user *) arg;
 	if (copy_from_user(dst, &src[index], sizeof(*dst)))
+	{
+		printk(KERN_ERR "LINE 6427\n");
 		return -EFAULT;
+	}
 	return 0;
 }
 
@@ -6540,6 +6623,9 @@ err:
 	kvfree(pages);
 	kvfree(vmas);
 	io_sqe_buffer_unregister(ctx);
+	if (ret == -EFAULT){
+		printk(KERN_ERR "line has error");
+	}
 	return ret;
 }
 
@@ -6552,8 +6638,10 @@ static int io_eventfd_register(struct io_ring_ctx *ctx, void __user *arg)
 		return -EBUSY;
 
 	if (copy_from_user(&fd, fds, sizeof(*fds)))
+	{
+		printk(KERN_ERR "line has error");
 		return -EFAULT;
-
+	}
 	ctx->cq_ev_fd = eventfd_ctx_fdget(fd);
 	if (IS_ERR(ctx->cq_ev_fd)) {
 		int ret = PTR_ERR(ctx->cq_ev_fd);
@@ -6687,6 +6775,7 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 		{
 			list_del_rcu(ptr);
 			si->ctx_len--;
+			printk(KERN_ERR "Killed context\n");
 			return;
 		}
 	}
@@ -7230,7 +7319,10 @@ static long io_uring_setup(u32 entries, struct io_uring_params __user *params)
 		return ret;
 
 	if (copy_to_user(params, &p, sizeof(p)))
+	{
+		printk(KERN_ERR "LINE 7244\n");
 		return -EFAULT;
+	}
 
 	return ret;
 }
@@ -7274,9 +7366,14 @@ static int io_probe(struct io_ring_ctx *ctx, void __user *arg, unsigned nr_args)
 
 	ret = 0;
 	if (copy_to_user(arg, p, size))
+	{
+		printk(KERN_ERR "LINE 7291\n");
 		ret = -EFAULT;
+	}
 out:
 	kfree(p);
+	if (ret == -EFAULT)
+		printk(KERN_ERR "line has error\n");
 	return ret;
 }
 
