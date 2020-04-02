@@ -5262,7 +5262,7 @@ static int io_sq_thread_ctx_list(void *data)
 				    (!time_after(jiffies, timeout) && ret != -EBUSY &&
 				    !percpu_ref_is_dying(&ctx_ptr->refs))) {
 					rcu_read_unlock();
-					printk(KERN_ERR "rescheduled\n");
+					//printk(KERN_ERR "rescheduled\n");
 					cond_resched();
 					rcu_read_lock();
 					goto next;
@@ -5293,7 +5293,7 @@ static int io_sq_thread_ctx_list(void *data)
 				if (!to_submit || ret == -EBUSY) {
 					if (kthread_should_park()) {
 						rcu_read_unlock();
-						printk(KERN_ERR "parked\n");
+						//printk(KERN_ERR "parked\n");
 						kthread_parkme();
 						rcu_read_lock();
 						//finish_wait(&ctx_ptr->sqo_wait, &wait);
