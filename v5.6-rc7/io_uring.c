@@ -5142,7 +5142,7 @@ fail_req:
 		}
 
 		//ADDED THIS CODE TO GET RIGHT MM
-		if (si->si_cur_mm != mm)
+		if (si->si_cur_mm != *mm)
 		{
 			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
 			if (unlikely(mm_fault)) {
@@ -6310,12 +6310,15 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 								"io_uring-sq");
 				si->ctx_len = 0;
 				add_to_context_list(ctx);
+				wake_up_process(si->head_sqo_thread);
 				//ctx->sqo_thread = si->head_sqo_thread;
 			}
 			else{
 				add_to_context_list(ctx);
 			}
 		}
+		printk(KERN_ERR "should be awake");
+		wake_up_process(si->head_sqo_thread);
 		}
 		/*
 		if (IS_ERR(ctx->sqo_thread)) {
@@ -6326,7 +6329,7 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 		wake_up_process(ctx->sqo_thread);
 	  }
 	  */
-		wake_up_process(si->head_sqo_thread);
+
 	if (p->flags & IORING_SETUP_SQ_AFF) {
 		/* Can't have SQ_AFF without SQPOLL */
 		ret = -EINVAL;
@@ -6779,7 +6782,6 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 			return;
 		}
 	}
-	return;
 
 	io_ring_ctx_free(ctx);
 }
@@ -7593,6 +7595,7 @@ static int __init io_uring_init(void)
 	si = kmalloc(sizeof(struct schedule_info), GFP_NOWAIT);
 	if (!si)
 		printk(KERN_ERR "IF IT GETS HERE, THIS IS BROKEN\n");
+	si->head_sqo_thread = NULL;
 	si->si_ctx = kmalloc(sizeof(struct si_context), GFP_KERNEL);
 	INIT_LIST_HEAD(&si->si_ctx->ctx_list);
 
