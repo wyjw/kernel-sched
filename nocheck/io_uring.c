@@ -5257,7 +5257,7 @@ static int io_sq_thread_ctx_list(void *data)
 
 	return 0;
 }
-
+/*
 static int io_sq_thread(void *data)
 {
 	struct io_ring_ctx *ctx = data;
@@ -5291,30 +5291,16 @@ static int io_sq_thread(void *data)
 
 		to_submit = io_sqring_entries(ctx);
 
-		/*
-		 * If submit got -EBUSY, flag us as needing the application
-		 * to enter the kernel to reap and flush events.
-		 */
+
 		if (!to_submit || ret == -EBUSY) {
-			/*
-			 * Drop cur_mm before scheduling, we can't hold it for
-			 * long periods (or over schedule()). Do this before
-			 * adding ourselves to the waitqueue, as the unuse/drop
-			 * may sleep.
-			 */
+
 			if (cur_mm) {
 				unuse_mm(cur_mm);
 				mmput(cur_mm);
 				cur_mm = NULL;
 			}
 
-			/*
-			 * We're polling. If we're within the defined idle
-			 * period, then let us spin without work before going
-			 * to sleep. The exception is if we got EBUSY doing
-			 * more IO, we should wait for the application to
-			 * reap events and wake us up.
-			 */
+
 			if (!list_empty(&ctx->poll_list) ||
 			    (!time_after(jiffies, timeout) && ret != -EBUSY &&
 			    !percpu_ref_is_dying(&ctx->refs))) {
@@ -5325,22 +5311,15 @@ static int io_sq_thread(void *data)
 			prepare_to_wait(&ctx->sqo_wait, &wait,
 						TASK_INTERRUPTIBLE);
 
-			/*
-			 * While doing polled IO, before going to sleep, we need
-			 * to check if there are new reqs added to poll_list, it
-			 * is because reqs may have been punted to io worker and
-			 * will be added to poll_list later, hence check the
-			 * poll_list again.
-			 */
+
 			if ((ctx->flags & IORING_SETUP_IOPOLL) &&
 			    !list_empty_careful(&ctx->poll_list)) {
 				finish_wait(&ctx->sqo_wait, &wait);
 				continue;
 			}
 
-			/* Tell userspace we may need a wakeup call */
 			ctx->rings->sq_flags |= IORING_SQ_NEED_WAKEUP;
-			/* make sure to read SQ tail after writing flags */
+
 			smp_mb();
 
 			to_submit = io_sqring_entries(ctx);
@@ -5381,7 +5360,7 @@ static int io_sq_thread(void *data)
 
 	return 0;
 }
-
+*/
 struct io_wait_queue {
 	struct wait_queue_entry wq;
 	struct io_ring_ctx *ctx;
@@ -6865,6 +6844,29 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 	long ret = -EBADF;
 	int submitted = 0;
 	struct fd f;
+
+	if (flags & IORING_ENTER_CLEANUP) {
+		if (si)
+		{
+			printk(KERN_ERR "GOT HERE into cleanup");
+			if (si->head_sqo_thread)
+			{
+				ret = kthread_park(si->head_sqo_thread);
+				ret = kthread_stop(si->head_sqo_thread);
+				si->head_sqo_thread = NULL;
+
+				struct io_ring_ctx *ctx_ptr = NULL;
+				struct list_head *ptr = NULL;
+				struct list_head *q = NULL;
+				list_for_each_safe(ptr, q, &si->si_ctx->ctx_list)
+				{
+					ctx_ptr = list_entry(ptr, struct si_context, ctx_list)->ring_ctx;
+					io_ring_ctx_wait_and_kill(ctx_ptr);
+				}
+			}
+		}
+		goto out_fput;
+	}
 
 	if (flags & ~(IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP))
 		return -EINVAL;
