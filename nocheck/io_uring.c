@@ -5216,6 +5216,9 @@ static int io_sq_thread_ctx_list(void *data)
 			//cur_mm = context_ptr->cur_mm;
 
 			//printk(KERN_ERR "RING is %d\n", ctx_ptr->rings);
+			if (kthread_should_park()){
+				goto end;
+			}
 
 			if (!list_empty(&ctx_ptr->poll_list)) {
 				unsigned nr_events = 0;
@@ -5244,7 +5247,8 @@ static int io_sq_thread_ctx_list(void *data)
 		rcu_read_unlock();
 	}
 
-	//rcu_read_unlock();
+end:
+	rcu_read_unlock();
 
 	set_fs(old_fs);
 	if (si->si_cur_mm) {
@@ -6665,22 +6669,6 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 	idr_for_each(&ctx->personality_idr, io_remove_personalities, ctx);
 	wait_for_completion(&ctx->completions[0]);
 
-	// code for si context list cleanup
-	struct io_ring_ctx *ctx_ptr = NULL;
-	struct list_head *ptr = NULL;
-	struct list_head *q = NULL;
-	list_for_each_safe(ptr, q, &si->si_ctx->ctx_list)
-	{
-		ctx_ptr = list_entry(ptr, struct si_context, ctx_list)->ring_ctx;
-		if (ctx_ptr == ctx)
-		{
-			list_del_rcu(ptr);
-			si->ctx_len--;
-			printk(KERN_ERR "Killed context\n");
-			return;
-		}
-	}
-
 	io_ring_ctx_free(ctx);
 }
 
@@ -6855,13 +6843,16 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 				ret = kthread_stop(si->head_sqo_thread);
 				si->head_sqo_thread = NULL;
 
+				// code for si context list cleanup
 				struct io_ring_ctx *ctx_ptr = NULL;
 				struct list_head *ptr = NULL;
 				struct list_head *q = NULL;
 				list_for_each_safe(ptr, q, &si->si_ctx->ctx_list)
 				{
 					ctx_ptr = list_entry(ptr, struct si_context, ctx_list)->ring_ctx;
-					io_ring_ctx_wait_and_kill(ctx_ptr);
+					list_del_rcu(ptr);
+					si->ctx_len--;
+					printk(KERN_ERR "Killed context\n");
 				}
 			}
 		}
