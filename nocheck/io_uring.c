@@ -256,6 +256,9 @@ struct io_ring_ctx {
 	unsigned		nr_user_bufs;
 	struct io_mapped_ubuf	*user_bufs;
 
+	unsigned sampling;
+	unsigned cached_sample_tail;
+
 	struct user_struct	*user;
 
 	const struct cred	*creds;
@@ -5192,6 +5195,8 @@ static int io_sq_thread_ctx_list(void *data)
 	DEFINE_WAIT(wait);
 	unsigned long timeout;
 	int ret = 0;
+	unsigned long sampling;
+	unsigned long interval = HZ;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
@@ -5204,8 +5209,12 @@ static int io_sq_thread_ctx_list(void *data)
 		old_cred = override_creds(ctx_ptr->creds);
 
 		timeout = jiffies + ctx_ptr->sq_thread_idle;
+
+		ctx_ptr->cached_sample_tail = ctx_ptr->cached_cq_tail;
 	}
 	rcu_read_unlock();
+
+	sampling = jiffies + interval;
 
 	while (!kthread_should_park()) {
 		rcu_read_lock();
@@ -5216,9 +5225,6 @@ static int io_sq_thread_ctx_list(void *data)
 			//cur_mm = context_ptr->cur_mm;
 
 			//printk(KERN_ERR "RING is %d\n", ctx_ptr->rings);
-			if (kthread_should_park()){
-				goto end;
-			}
 
 			if (!list_empty(&ctx_ptr->poll_list)) {
 				unsigned nr_events = 0;
@@ -5235,6 +5241,16 @@ static int io_sq_thread_ctx_list(void *data)
 
 			to_submit = io_sqring_entries(ctx_ptr);
 
+			if (!to_submit)
+			{
+				if (time_after(jiffies, sampling))
+				{
+					printk(KERN_ERR "Diff is %d\n", ctx_ptr->cached_sample_tail - READ_ONCE(ctx_ptr->rings->cq.head));
+					ctx_ptr->cached_sample_tail = READ_ONCE(ctx_ptr->rings->cq.head);
+					sampling = jiffies + interval;
+				}
+			}
+
 			rcu_read_unlock();
 			mutex_lock(&ctx_ptr->uring_lock);
 			ret = io_submit_sqes(ctx_ptr, to_submit, NULL, -1, &context_ptr->cur_mm, true);
@@ -5247,8 +5263,7 @@ static int io_sq_thread_ctx_list(void *data)
 		rcu_read_unlock();
 	}
 
-end:
-	rcu_read_unlock();
+	//rcu_read_unlock();
 
 	set_fs(old_fs);
 	if (si->si_cur_mm) {
@@ -6669,6 +6684,22 @@ static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
 	idr_for_each(&ctx->personality_idr, io_remove_personalities, ctx);
 	wait_for_completion(&ctx->completions[0]);
 
+	// code for si context list cleanup
+	struct io_ring_ctx *ctx_ptr = NULL;
+	struct list_head *ptr = NULL;
+	struct list_head *q = NULL;
+	list_for_each_safe(ptr, q, &si->si_ctx->ctx_list)
+	{
+		ctx_ptr = list_entry(ptr, struct si_context, ctx_list)->ring_ctx;
+		if (ctx_ptr == ctx)
+		{
+			list_del_rcu(ptr);
+			si->ctx_len--;
+			printk(KERN_ERR "Killed context\n");
+			return;
+		}
+	}
+
 	io_ring_ctx_free(ctx);
 }
 
@@ -6843,16 +6874,13 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 				ret = kthread_stop(si->head_sqo_thread);
 				si->head_sqo_thread = NULL;
 
-				// code for si context list cleanup
 				struct io_ring_ctx *ctx_ptr = NULL;
 				struct list_head *ptr = NULL;
 				struct list_head *q = NULL;
 				list_for_each_safe(ptr, q, &si->si_ctx->ctx_list)
 				{
 					ctx_ptr = list_entry(ptr, struct si_context, ctx_list)->ring_ctx;
-					list_del_rcu(ptr);
-					si->ctx_len--;
-					printk(KERN_ERR "Killed context\n");
+					io_ring_ctx_wait_and_kill(ctx_ptr);
 				}
 			}
 		}
