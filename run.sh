@@ -21,6 +21,7 @@ sudo qemu-system-x86_64 -curses -kernel linux/arch/x86_64/boot/bzImage -hda qemu
 THIS ONE:
 sudo qemu-system-x86_64 -curses -kernel ~/kernel/linux/arch/x86_64/boot/bzImage -hda qemu-image.img -append "root=/dev/sda rw" --enable-kvm -net nic,model=virtio -net tap,ifname=tap0,script=no,downscript=no -m 4096 -smp 4
 
+sudo qemu-system-x86_64 -curses -kernel linux-speed/arch/x86_64/boot/bzImage -hda qemu-image.img -append "root=/dev/sda rw console=ttyS0" --enable-kvm -m 4096 -smp 4 -serial file:a.out
 
 sudo qemu-system-x86_64 -curses -kernel ~/kernel/linux/arch/x86_64/boot/bzImage -hda qemu-image.img -append "root=/dev/sda rw" --enable-kvm -device e1000 -netdev tap,id=mynet0,ifname=tap1,script=no,downscript=no
 
