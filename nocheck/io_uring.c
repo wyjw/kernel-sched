@@ -769,6 +769,7 @@ struct schedule_info{
 	struct mm_struct	*si_cur_mm;
 	int ctx_len;
 	unsigned sq_thread_idle;
+	struct mutex whole_thread_lock;
 };
 
 //Schedule adjustments
@@ -1625,7 +1626,8 @@ static int io_do_iopoll(struct io_ring_ctx *ctx, unsigned int *nr_events,
 	 * Only spin for completions if we don't have multiple devices hanging
 	 * off our complete list, and we're under the requested amount.
 	 */
-	spin = !ctx->poll_multi_file && *nr_events < min;
+	spin = false;
+	//spin = !ctx->poll_multi_file && *nr_events < min;
 
 	ret = 0;
 	list_for_each_entry_safe(req, tmp, &ctx->poll_list, list) {
@@ -5233,14 +5235,17 @@ static int io_sq_thread_ctx_list(void *data)
 				mutex_lock(&ctx_ptr->uring_lock);
 				if (!list_empty(&ctx_ptr->poll_list))
 					io_iopoll_getevents(ctx_ptr, &nr_events, 0);
-				else
-					timeout = jiffies + ctx_ptr->sq_thread_idle;
 				mutex_unlock(&ctx_ptr->uring_lock);
 				rcu_read_lock();
 			}
 
 			to_submit = io_sqring_entries(ctx_ptr);
 
+			if (!to_submit)
+			{
+				continue;
+			}
+			/*
 			if (!to_submit)
 			{
 				if (time_after(jiffies, sampling))
@@ -5250,6 +5255,7 @@ static int io_sq_thread_ctx_list(void *data)
 					sampling = jiffies + interval;
 				}
 			}
+			*/
 
 			rcu_read_unlock();
 			mutex_lock(&ctx_ptr->uring_lock);
@@ -6205,21 +6211,25 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 
 			ctx->sqo_thread = NULL;
 
+			mutex_lock(&si->whole_thread_lock);
 			if (!si->head_sqo_thread) {
 				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread_ctx_list,
-							ctx, cpu,
+							ctx, nr_cpu_ids-1,
 							"io_uring-sq");
 				si->ctx_len = 0;
 				add_to_context_list(ctx);
+				wake_up_process(si->head_sqo_thread);
 				//ctx->sqo_thread = si->head_sqo_thread;
 			}
 			else{
 				add_to_context_list(ctx);
 			}
+			mutex_unlock(&si->whole_thread_lock);
 		} else {
 
 			ctx->sqo_thread = NULL;
 
+			mutex_lock(&si->whole_thread_lock);
 			if (!si->head_sqo_thread) {
 				printk(KERN_ERR "got here\n");
 				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread_ctx_list, NULL,
@@ -6233,6 +6243,7 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 			else{
 				add_to_context_list(ctx);
 			}
+			mutex_unlock(&si->whole_thread_lock);
 		}
 		printk(KERN_ERR "should be awake");
 		wake_up_process(si->head_sqo_thread);
@@ -6880,7 +6891,7 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 				list_for_each_safe(ptr, q, &si->si_ctx->ctx_list)
 				{
 					ctx_ptr = list_entry(ptr, struct si_context, ctx_list)->ring_ctx;
-					io_ring_ctx_wait_and_kill(ctx_ptr);
+					list_del_rcu(ptr);
 				}
 			}
 		}
@@ -7539,6 +7550,7 @@ static int __init io_uring_init(void)
 	si->si_ctx = kmalloc(sizeof(struct si_context), GFP_KERNEL);
 	INIT_LIST_HEAD(&si->si_ctx->ctx_list);
 
+	mutex_init(&si->whole_thread_lock);
 	return 0;
 };
 __initcall(io_uring_init);
