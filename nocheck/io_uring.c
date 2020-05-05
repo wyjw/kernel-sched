@@ -758,6 +758,7 @@ struct si_context {
 	//struct sqe_submit sqes[IO_IOPOLL_BATCH];
 	struct io_uring_sqe	*si_sqes;
 	struct mm_struct *cur_mm;
+	unsigned int to_submit;
 };
 
 struct schedule_info{
@@ -5222,7 +5223,6 @@ static int io_sq_thread_ctx_list(void *data)
 		rcu_read_lock();
 		list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
 		{
-			unsigned int to_submit;
 			ctx_ptr = context_ptr->ring_ctx;
 			//cur_mm = context_ptr->cur_mm;
 
@@ -5239,12 +5239,8 @@ static int io_sq_thread_ctx_list(void *data)
 				rcu_read_lock();
 			}
 
-			to_submit = io_sqring_entries(ctx_ptr);
+			context_ptr->to_submit = io_sqring_entries(ctx_ptr);
 
-			if (!to_submit)
-			{
-				continue;
-			}
 			/*
 			if (!to_submit)
 			{
@@ -5256,15 +5252,22 @@ static int io_sq_thread_ctx_list(void *data)
 				}
 			}
 			*/
-
-			rcu_read_unlock();
-			mutex_lock(&ctx_ptr->uring_lock);
-			ret = io_submit_sqes(ctx_ptr, to_submit, NULL, -1, &context_ptr->cur_mm, true);
-			//printk(KERN_ERR "RING is %d\n", ctx_ptr->rings);
-			//printk(KERN)
-			mutex_unlock(&ctx_ptr->uring_lock);
-			timeout = jiffies + ctx_ptr->sq_thread_idle;
-			rcu_read_lock();
+			if (context_ptr->to_submit)
+			{
+				rcu_read_unlock();
+				mutex_lock(&ctx_ptr->uring_lock);
+				ret = io_submit_sqes(ctx_ptr, context_ptr->to_submit, NULL, -1, &context_ptr->cur_mm, true);
+				mutex_unlock(&ctx_ptr->uring_lock);
+				timeout = jiffies + ctx_ptr->sq_thread_idle;
+				rcu_read_lock();
+			}
+			else
+			{
+				rcu_read_unlock();
+				cond_resched();
+				rcu_read_lock();
+				continue;
+			}
 		}
 		rcu_read_unlock();
 	}
@@ -6214,8 +6217,9 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 			mutex_lock(&si->whole_thread_lock);
 			if (!si->head_sqo_thread) {
 				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread_ctx_list,
-							ctx, nr_cpu_ids-1,
+							ctx, num_online_cpus()-1,
 							"io_uring-sq");
+				printk(KERN_ERR "WE HAVE IT ON %d", num_online_cpus()-1);
 				si->ctx_len = 0;
 				add_to_context_list(ctx);
 				wake_up_process(si->head_sqo_thread);
@@ -6233,8 +6237,9 @@ static int io_sq_offload_start(struct io_ring_ctx *ctx,
 			if (!si->head_sqo_thread) {
 				printk(KERN_ERR "got here\n");
 				si->head_sqo_thread = kthread_create_on_cpu(io_sq_thread_ctx_list, NULL,
-								nr_cpu_ids-1,
+								num_online_cpus()-1,
 								"io_uring-sq");
+				printk(KERN_ERR "WE HAVE IT ON %d", num_online_cpus()-1);
 				si->ctx_len = 0;
 				add_to_context_list(ctx);
 				wake_up_process(si->head_sqo_thread);
