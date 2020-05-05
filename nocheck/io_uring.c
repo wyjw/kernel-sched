@@ -759,6 +759,7 @@ struct si_context {
 	struct io_uring_sqe	*si_sqes;
 	struct mm_struct *cur_mm;
 	unsigned int to_submit;
+	unsigned int ret;
 };
 
 struct schedule_info{
@@ -5200,6 +5201,7 @@ static int io_sq_thread_ctx_list(void *data)
 	int ret = 0;
 	unsigned long sampling;
 	unsigned long interval = HZ;
+	unsigned int ctx_num = 0;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
@@ -5223,6 +5225,7 @@ static int io_sq_thread_ctx_list(void *data)
 		rcu_read_lock();
 		list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
 		{
+			ctx_num += 1;	
 			ctx_ptr = context_ptr->ring_ctx;
 			//cur_mm = context_ptr->cur_mm;
 
@@ -5241,6 +5244,15 @@ static int io_sq_thread_ctx_list(void *data)
 
 			context_ptr->to_submit = io_sqring_entries(ctx_ptr);
 
+			if ((!context_ptr->to_submit || context_ptr->ret == -EBUSY) && ctx_num < 2 * si->ctx_len)
+			{
+				rcu_read_unlock();
+				cond_resched();
+				rcu_read_lock();
+				continue;
+			}
+
+			ctx_num = 0;
 			/*
 			if (!to_submit)
 			{
@@ -5252,22 +5264,12 @@ static int io_sq_thread_ctx_list(void *data)
 				}
 			}
 			*/
-			if (context_ptr->to_submit)
-			{
-				rcu_read_unlock();
-				mutex_lock(&ctx_ptr->uring_lock);
-				ret = io_submit_sqes(ctx_ptr, context_ptr->to_submit, NULL, -1, &context_ptr->cur_mm, true);
-				mutex_unlock(&ctx_ptr->uring_lock);
-				timeout = jiffies + ctx_ptr->sq_thread_idle;
-				rcu_read_lock();
-			}
-			else
-			{
-				rcu_read_unlock();
-				cond_resched();
-				rcu_read_lock();
-				continue;
-			}
+			rcu_read_unlock();
+			mutex_lock(&ctx_ptr->uring_lock);
+			context_ptr->ret = io_submit_sqes(ctx_ptr, context_ptr->to_submit, NULL, -1, &context_ptr->cur_mm, true);
+			mutex_unlock(&ctx_ptr->uring_lock);
+			timeout = jiffies + ctx_ptr->sq_thread_idle;
+			rcu_read_lock();
 		}
 		rcu_read_unlock();
 	}
