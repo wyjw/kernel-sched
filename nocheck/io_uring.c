@@ -5326,6 +5326,7 @@ static int io_sq_thread_ctx_list(void *data)
 
 	sampling = jiffies + interval;
 
+	timeout = jiffies + HZ;
 	while (!kthread_should_park()) {
 		rcu_read_lock();
 		list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
@@ -5352,12 +5353,25 @@ static int io_sq_thread_ctx_list(void *data)
 			if ((!context_ptr->to_submit))
 			{
 				//trace_sq_thread_busy_poll(ctx_ptr);
-				rcu_read_unlock();
-				if (signal_pending(current))
-					flush_signals(current);
-				cond_resched();
-				rcu_read_lock();
-				continue;
+				if (!list_empty(&ctx_ptr->poll_list) ||
+						(!time_after(jiffies, timeout) && ret != -EBUSY &&
+						!percpu_ref_is_dying(&ctx_ptr->refs))) {
+							rcu_read_unlock();
+							if (signal_pending(current))
+								flush_signals(current);
+							cond_resched();
+							rcu_read_lock();
+							continue;
+				}
+
+				if (!context_ptr->to_submit) {
+					if (signal_pending(current))
+						flush_signals(current);
+					rcu_read_unlock();
+					schedule();
+					rcu_read_lock();
+					continue;
+				}
 			}
 
 			/*
