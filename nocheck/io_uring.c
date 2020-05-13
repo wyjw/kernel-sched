@@ -5079,6 +5079,113 @@ static bool io_get_sqring(struct io_ring_ctx *ctx, struct io_kiocb *req,
 	return false;
 }
 
+static int io_submit_sqes_ctx_list(struct io_ring_ctx *ctx, unsigned int nr,
+				struct file *ring_file, int ring_fd,
+				struct mm_struct **mm, bool async)
+{
+	struct io_submit_state state, *statep = NULL;
+	struct io_kiocb *link = NULL;
+	int i, submitted = 0;
+	bool mm_fault = false;
+
+	/* if we have a backlog and couldn't flush it all, return BUSY */
+	if (test_bit(0, &ctx->sq_check_overflow)) {
+		if (!list_empty(&ctx->cq_overflow_list) &&
+				!io_cqring_overflow_flush(ctx, false))
+			return -EBUSY;
+	}
+
+	/* make sure SQ entry isn't read before tail */
+	nr = min3(nr, ctx->sq_entries, io_sqring_entries(ctx));
+
+	if (!percpu_ref_tryget_many(&ctx->refs, nr))
+		return -EAGAIN;
+
+	if (nr > IO_PLUG_THRESHOLD) {
+		io_submit_state_start(&state, nr);
+		statep = &state;
+	}
+
+	ctx->ring_fd = ring_fd;
+	ctx->ring_file = ring_file;
+
+	for (i = 0; i < nr; i++) {
+		const struct io_uring_sqe *sqe;
+		struct io_kiocb *req;
+		int err;
+
+		req = io_get_req(ctx, statep);
+		if (unlikely(!req)) {
+			if (!submitted)
+				submitted = -EAGAIN;
+			break;
+		}
+		if (!io_get_sqring(ctx, req, &sqe)) {
+			__io_req_do_free(req);
+			break;
+		}
+
+		/* will complete beyond this point, count as submitted */
+		submitted++;
+
+		if (unlikely(req->opcode >= IORING_OP_LAST)) {
+			err = -EINVAL;
+fail_req:
+			io_cqring_add_event(req, err);
+			io_double_put_req(req);
+			break;
+		}
+
+		if (io_op_defs[req->opcode].needs_mm && !*mm) {
+			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
+			if (unlikely(mm_fault)) {
+				printk(KERN_ERR "1");
+				err = -EFAULT;
+				goto fail_req;
+			}
+			use_mm(ctx->sqo_mm);
+			*mm = ctx->sqo_mm;
+			si->si_cur_mm = ctx->sqo_mm;
+		}
+
+		//ADDED THIS CODE TO GET RIGHT MM
+		if (si->si_cur_mm != *mm)
+		{
+			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
+			if (unlikely(mm_fault)) {
+				printk(KERN_ERR "1");
+				err = -EFAULT;
+				goto fail_req;
+			}
+			use_mm(ctx->sqo_mm);
+			*mm = ctx->sqo_mm;
+			si->si_cur_mm = ctx->sqo_mm;
+		}
+
+		req->in_async = async;
+		req->needs_fixed_file = async;
+		trace_io_uring_submit_sqe(ctx, req->opcode, req->user_data,
+						true, async);
+		if (!io_submit_sqe(req, sqe, statep, &link))
+			break;
+	}
+
+	if (unlikely(submitted != nr)) {
+		int ref_used = (submitted == -EAGAIN) ? 0 : submitted;
+
+		percpu_ref_put_many(&ctx->refs, nr - ref_used);
+	}
+	if (link)
+		io_queue_link_head(link);
+	if (statep)
+		io_submit_state_end(&state);
+
+	 /* Commit SQ ring head once we've consumed and submitted all SQEs */
+	io_commit_sqring(ctx);
+
+	return submitted;
+}
+
 static int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr,
 			  struct file *ring_file, int ring_fd,
 			  struct mm_struct **mm, bool async)
@@ -5187,7 +5294,6 @@ fail_req:
 	return submitted;
 }
 
-
 static int io_sq_thread_ctx_list(void *data)
 {
 	struct io_ring_ctx *ctx = data;
@@ -5201,7 +5307,6 @@ static int io_sq_thread_ctx_list(void *data)
 	int ret = 0;
 	unsigned long sampling;
 	unsigned long interval = HZ;
-	unsigned int ctx_num = 0;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
@@ -5225,12 +5330,12 @@ static int io_sq_thread_ctx_list(void *data)
 		rcu_read_lock();
 		list_for_each_entry_rcu(context_ptr, &si->si_ctx->ctx_list, ctx_list)
 		{
-			ctx_num += 1;	
 			ctx_ptr = context_ptr->ring_ctx;
 			//cur_mm = context_ptr->cur_mm;
 
 			//printk(KERN_ERR "RING is %d\n", ctx_ptr->rings);
 
+			//trace_sq_thread_enter_poll(ctx_ptr);
 			if (!list_empty(&ctx_ptr->poll_list)) {
 				unsigned nr_events = 0;
 
@@ -5243,16 +5348,18 @@ static int io_sq_thread_ctx_list(void *data)
 			}
 
 			context_ptr->to_submit = io_sqring_entries(ctx_ptr);
-
-			if ((!context_ptr->to_submit || context_ptr->ret == -EBUSY) && ctx_num < 2 * si->ctx_len)
+			//trace_sq_thread_to_submit(context_ptr->to_submit);
+			if ((!context_ptr->to_submit))
 			{
+				//trace_sq_thread_busy_poll(ctx_ptr);
 				rcu_read_unlock();
+				if (signal_pending(current))
+					flush_signals(current);
 				cond_resched();
 				rcu_read_lock();
 				continue;
 			}
 
-			ctx_num = 0;
 			/*
 			if (!to_submit)
 			{
@@ -5266,7 +5373,9 @@ static int io_sq_thread_ctx_list(void *data)
 			*/
 			rcu_read_unlock();
 			mutex_lock(&ctx_ptr->uring_lock);
+			//trace_sq_thread_before_submit(ctx_ptr);
 			context_ptr->ret = io_submit_sqes(ctx_ptr, context_ptr->to_submit, NULL, -1, &context_ptr->cur_mm, true);
+			//trace_sq_thread_after_submit(context_ptr->ret);
 			mutex_unlock(&ctx_ptr->uring_lock);
 			timeout = jiffies + ctx_ptr->sq_thread_idle;
 			rcu_read_lock();
