@@ -113,3 +113,5 @@ fallocate -l 5G a.img
 
 #debug stuff
 addr2line -f -e vmlinux 30c
+
+# on mac use ESC + 2 to get qemu status on ssh
